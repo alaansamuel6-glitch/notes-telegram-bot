@@ -7,12 +7,14 @@ from datetime import datetime, timedelta
 
 from config import token
 from database import (
-    init_db, add_reminder, get_user_reminders, get_all_pending, 
-    delete_reminder, add_note, get_notes, delete_note
+    init_db, add_reminder, get_user_reminders, get_all_pending,
+    delete_reminder, add_note, get_notes, delete_note,
+    mark_done, get_stats
 )
 
 bot = telebot.TeleBot(token)
 user_states = {}
+
 
 def parse_when(raw: str) -> datetime | None:
     raw = raw.strip()
@@ -32,12 +34,13 @@ def parse_when(raw: str) -> datetime | None:
     except ValueError:
         return None
 
+
 def reminder_worker():
     print("⏰ Поток напоминаний запущен...")
     while True:
         now = datetime.now()
         pending = get_all_pending()
-        
+
         for rid, user_id, text, at in pending:
             remind_at = datetime.strptime(at, "%Y-%m-%d %H:%M")
             if remind_at <= now:
@@ -47,17 +50,19 @@ def reminder_worker():
                         f"🔔 <b>Напоминание!</b>\n\n📝 {text}",
                         parse_mode="HTML"
                     )
-                    # Физически удаляем из базы после отправки
                     delete_reminder(rid)
                 except Exception as e:
                     print(f"Ошибка отправки для {user_id}: {e}")
-        
+
         time.sleep(30)
+
 
 @bot.message_handler(commands=['start'])
 def cmd_start(message):
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
     markup.add(types.KeyboardButton("📝 Добавить дело"), types.KeyboardButton("📋 Мои дела"))
+    markup.add(types.KeyboardButton("📒 Добавить заметку"), types.KeyboardButton("📓 Мои заметки"))
+    markup.add(types.KeyboardButton("📊 Статистика"))
     bot.send_message(
         message.chat.id,
         "👋 Привет! Я твой ежедневник-напоминалка.\n\n"
@@ -65,6 +70,7 @@ def cmd_start(message):
         "Для заметок используй: /note <текст>",
         reply_markup=markup
     )
+
 
 @bot.message_handler(commands=['help'])
 def cmd_help(message):
@@ -76,9 +82,11 @@ def cmd_help(message):
         "3. Напиши время: <code>ДД.ММ.ГГГГ ЧЧ:ММ</code> или <code>+30m</code>\n\n"
         "📒 <b>Заметки:</b>\n"
         "/note <текст> — сохранить заметку\n"
-        "/notes — показать все заметки",
+        "/notes — показать все заметки\n\n"
+        "📊 /stats — статистика",
         parse_mode="HTML"
     )
+
 
 @bot.message_handler(commands=['add'])
 @bot.message_handler(func=lambda m: m.text == "📝 Добавить дело")
@@ -86,11 +94,13 @@ def cmd_add(message):
     user_states[message.chat.id] = {"state": "waiting_text"}
     bot.send_message(message.chat.id, "📝 Что нужно сделать? (или /cancel для отмены)")
 
+
 @bot.message_handler(commands=['cancel'])
 def cmd_cancel(message):
     if message.chat.id in user_states:
         del user_states[message.chat.id]
     bot.send_message(message.chat.id, "❌ Отменено.", reply_markup=types.ReplyKeyboardRemove())
+
 
 @bot.message_handler(commands=['list'])
 @bot.message_handler(func=lambda m: m.text == "📋 Мои дела")
@@ -108,11 +118,12 @@ def cmd_list(message):
             types.InlineKeyboardButton("🗑 Удалить", callback_data=f"delete_{rid}")
         )
         bot.send_message(
-            message.chat.id, 
-            f"📝 <b>{text}</b>\n🕐 {dt.strftime('%d.%m.%Y %H:%M')}", 
-            parse_mode="HTML", 
+            message.chat.id,
+            f"📝 <b>{text}</b>\n🕐 {dt.strftime('%d.%m.%Y %H:%M')}",
+            parse_mode="HTML",
             reply_markup=markup
         )
+
 
 @bot.message_handler(func=lambda m: m.chat.id in user_states and user_states[m.chat.id]["state"] == "waiting_text")
 def process_text(message):
@@ -124,10 +135,11 @@ def process_text(message):
         parse_mode="HTML"
     )
 
+
 @bot.message_handler(func=lambda m: m.chat.id in user_states and user_states[m.chat.id]["state"] == "waiting_time")
 def process_time(message):
     remind_at = parse_when(message.text)
-    
+
     if not remind_at:
         bot.send_message(message.chat.id, "❌ Не понял дату. Введи ещё раз (например, +30m):")
         return
@@ -137,36 +149,57 @@ def process_time(message):
 
     text = user_states[message.chat.id]["text"]
     rid = add_reminder(message.from_user.id, text, remind_at)
-    
+
     del user_states[message.chat.id]
-    
+
     bot.send_message(
         message.chat.id,
         f"✅ Записал!\n\n📝 <b>{text}</b>\n🕐 {remind_at.strftime('%d.%m.%Y %H:%M')}\nID: <code>{rid}</code>",
         parse_mode="HTML"
     )
 
+
 @bot.message_handler(commands=['note'])
+@bot.message_handler(func=lambda m: m.text == "📒 Добавить заметку")
 def save_note(message):
+    if message.text == "📒 Добавить заметку":
+        user_states[message.chat.id] = {"state": "waiting_note_text"}
+        bot.send_message(message.chat.id, "📒 Напиши текст заметки (или /cancel для отмены):")
+        return
+
     text = message.text.replace("/note", "").strip()
     if not text:
         bot.send_message(message.chat.id, "Напиши так: /note Купить хлеб")
         return
-    
+
     add_note(message.from_user.id, text)
     bot.send_message(message.chat.id, "✅ Заметка сохранена!")
 
+
+@bot.message_handler(func=lambda m: m.chat.id in user_states and user_states[m.chat.id]["state"] == "waiting_note_text")
+def process_note_text(message):
+    text = message.text.strip()
+    if not text:
+        bot.send_message(message.chat.id, "❌ Пустая заметка. Напиши текст:")
+        return
+    add_note(message.from_user.id, text)
+    del user_states[message.chat.id]
+    bot.send_message(message.chat.id, "✅ Заметка сохранена!")
+
+
 @bot.message_handler(commands=['notes'])
+@bot.message_handler(func=lambda m: m.text == "📓 Мои заметки")
 def show_notes(message):
     notes = get_notes(message.from_user.id)
     if not notes:
         bot.send_message(message.chat.id, "📭 Заметок нет.")
         return
-    
+
     for nid, text in notes:
         markup = types.InlineKeyboardMarkup()
         markup.add(types.InlineKeyboardButton("🗑 Удалить", callback_data=f"delnote_{nid}"))
         bot.send_message(message.chat.id, f"📒 {text}", reply_markup=markup)
+
 
 @bot.message_handler(commands=['delnote'])
 def remove_note(message):
@@ -177,19 +210,57 @@ def remove_note(message):
     except:
         bot.send_message(message.chat.id, "Напиши так: /delnote 1")
 
+
+@bot.message_handler(commands=['stats'])
+@bot.message_handler(func=lambda m: m.text == "📊 Статистика")
+def cmd_stats(message):
+    s = get_stats(message.from_user.id)
+
+    nearest = "нет"
+    if s["nearest"]:
+        text, at = s["nearest"]
+        dt = datetime.strptime(at, "%Y-%m-%d %H:%M")
+        nearest = f"{text} — {dt.strftime('%d.%m.%Y %H:%M')}"
+
+    bot.send_message(
+        message.chat.id,
+        f"📊 <b>Твоя статистика</b>\n\n"
+        f"📝 Активных дел: <b>{s['active']}</b>\n"
+        f"✅ Выполнено: <b>{s['done']}</b>\n"
+        f"📅 На сегодня: <b>{s['today']}</b>\n"
+        f"🗓 На неделю: <b>{s['week']}</b>\n"
+        f"📒 Заметок: <b>{s['notes']}</b>\n\n"
+        f"🕐 Ближайшее: {nearest}",
+        parse_mode="HTML"
+    )
+
+
 @bot.callback_query_handler(func=lambda call: call.data.startswith(("done_", "delete_", "delnote_")))
 def callback_actions(call):
     parts = call.data.split("_")
     action, rid = parts[0], int(parts[1])
-    
-    if action in ("done", "delete"):
+
+    if action == "done":
+        mark_done(rid)
+        bot.edit_message_text(
+            "✅ Дело выполнено!",
+            call.message.chat.id, call.message.message_id
+        )
+    elif action == "delete":
         delete_reminder(rid)
-        bot.edit_message_text("🗑 Дело удалено (или выполнено).", call.message.chat.id, call.message.message_id)
+        bot.edit_message_text(
+            "🗑 Дело удалено.",
+            call.message.chat.id, call.message.message_id
+        )
     elif action == "delnote":
         delete_note(rid)
-        bot.edit_message_text("🗑 Заметка удалена.", call.message.chat.id, call.message.message_id)
-        
+        bot.edit_message_text(
+            "🗑 Заметка удалена.",
+            call.message.chat.id, call.message.message_id
+        )
+
     bot.answer_callback_query(call.id)
+
 
 if __name__ == "__main__":
     init_db()
